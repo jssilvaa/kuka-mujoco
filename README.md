@@ -2,7 +2,7 @@
 
 Numerical inverse kinematics (IK) for the KUKA LBR iiwa 14 in MuJoCo, using a damped least-squares (DLS) objective on both position and orientation error.
 
-## Model provenance
+## Menagerie model
 
 - MuJoCo model: [google-deepmind/mujoco_menagerie/kuka_iiwa_14](https://github.com/google-deepmind/mujoco_menagerie/tree/main/kuka_iiwa_14)
 
