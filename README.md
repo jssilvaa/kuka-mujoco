@@ -44,10 +44,16 @@ conda activate kukaconda
 python -m pip install -r requirements
 ```
 
-Run IK:
+Fetch model from MuJoCo Menagerie and run IK script:
 
 ```bash
+conda run -n kukaconda python src/fetch_model.py
 conda run -n kukaconda python src/ik.py
+```
+
+For visualization, set the `viewer` to `true` and run with `mjpython`: 
+```bash
+conda run -n kukaconda mjpython src/ik.py 
 ```
 
 ## References
