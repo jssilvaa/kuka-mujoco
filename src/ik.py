@@ -61,41 +61,64 @@ def Jl_inv(phi: np.ndarray, eps: float=1e-6) -> np.ndarray:
   return I3 + 0.5 * hat_phi + (1/(th * th) - (1 + np.cos(th))/(2 * th * np.sin(th))) * hat_phi @ hat_phi
 
 
-if __name__ == "__main__": 
-  # load model, data
-  model, data = __load_model("data/kuka_iiwa_14/scene.xml")
-  target_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_box")
-  ee_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "attachment_site")
+def __target_orientation(zd: np.ndarray, up: np.ndarray) -> np.ndarray:
+  """ compute target desired rotation orientation from `zd`: (3,) and `up`: (3,)"""
+  xd = np.cross(up, zd); xd /= np.linalg.norm(xd) 
+  yd = np.cross(zd, xd); yd /= np.linalg.norm(yd)
+  return np.column_stack((xd,yd,zd))
 
-  # preallocate jacobians 
+def __debug_metadata(model: mujoco.MjModel, data: mujoco.MjData): 
+  """ print metadata at the end of controller run """
+  # qfrc metadata 
+  print("qacc norm:", np.linalg.norm(data.qacc[:nq]))
+  print("qfrc_constraint norm:", np.linalg.norm(data.qfrc_constraint[:nq]))
+  print("qfrc_passive norm:", np.linalg.norm(data.qfrc_passive[:nq]))
+  print("qfrc_bias:", data.qfrc_bias[:nq])
+  print("qfrc_actuator:", data.qfrc_actuator[:nq])
+
+  # distance to joint limits 
+  q = data.qpos[:nq]
+  lo = model.jnt_range[:nq,0]
+  hi = model.jnt_range[:nq,1]
+  print("min dist to lo:", np.min(q-lo))
+  print("min dist to hi:", np.min(hi-q))
+
+  # contacts info 
+  print("ncon:", data.ncon)
+  for i in range(data.ncon):
+      c = data.contact[i]
+      g1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, c.geom1)
+      g2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, c.geom2)
+      print(i, g1, "<->", g2, "dist:", c.dist)
+
+def __solve_ik(
+    model: mujoco.MjModel, 
+    data: mujoco.MjData, 
+    target_id: int, 
+    ee_id: int, 
+    target_mat: np.ndarray,
+    dt: float=0.002,
+    lam: float=1e-3,
+    alpha: float=0.2,
+    tol: float=1e-6,
+    max_iter: int=1000,
+    ) -> np.ndarray: 
+  """ 
+    solves: 
+      dq = Je.T @ (Je @ Je.T + lam * I6)^-1 @ e 
+      let y = Je.T^-1 dq, then Ay = e, solve this 
+      where A = Je @ Je.T + lam * I6
+      return dq = Je.T @ y
+  """
   nq = model.nq
   nv = model.nv 
   Jp = np.zeros((3,nv))
   Jr = np.zeros((3,nv))
-
-  # desired ee orientation 
-  zd = np.array([0,0,-1], dtype=float)
-  up = np.array([0,1,0],dtype=float)
-  xd = np.cross(up, zd); xd /= np.linalg.norm(xd) # gram schmidt orthogonalization, we care only about zdown 
-  yd = np.cross(zd, xd)
-  target_mat = np.column_stack((xd,yd,zd))
-
-  # sim params 
-  dt = model.opt.timestep
-  lam = 1e-3 
-  alpha = 0.2 
-  tol = 1e-6
-  max_iter = 1000
   I6 = np.eye(6)
   for k in range(max_iter): 
     mujoco.mj_forward(model, data)
     mujoco.mj_jacSite(model, data, Jp, Jr, ee_id)
 
-    #solve: 
-    # dq = Je.T @ (Je @ Je.T + lam * I6)^-1 @ e 
-    # let y = Je.T^-1 dq, then Ay = e, solve this 
-    # where A = Je @ Je.T + lam * I6
-    # then dq = Je.T @ y
     err_lin, phi = __compute_err(data, target_id, ee_id), __compute_err_mat(data, target_mat, ee_id)
     err = np.concatenate((err_lin, phi))
     Je = np.vstack((Jp, Jl_inv(phi) @ Jr))
@@ -104,15 +127,34 @@ if __name__ == "__main__":
     y = np.linalg.solve(A, err)
     dq = Je.T @ y
 
-    # update 
     data.qpos[:nq] += alpha * dq[:nq]
     if np.linalg.norm(err) < tol: 
       print(f"IK Converged at iteration {k} with ||err||: ", np.linalg.norm(err))
-      break
+      break 
+  return data.qpos.copy() 
+
+
+if __name__ == "__main__": 
+  # load model, data
+  model, data = __load_model("data/kuka_iiwa_14/scene.xml")
+  target_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_box")
+  ee_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "attachment_site")
+
+  # dimensions of configuration, velocity, and actuator space 
+  nq = model.nq 
+  nv = model.nv 
+  nu = model.nu
+
+  # desired ee orientation 
+  zd = np.array([0,0,-1], dtype=float)
+  up = np.array([0,1,0],dtype=float)
+  target_mat = __target_orientation(zd, up)
+
+  # solve ik 
+  q_des = __solve_ik(model, data, target_id, ee_id, target_mat)
 
   # retrieve ik solution 
-  print("qpos_f: ", data.qpos) 
-  q_des = data.qpos.copy()
+  print("q_f: ", q_des) 
   mujoco.mj_resetDataKeyframe(model, data, 0)
 
   kp = model.actuator_gainprm[:model.nu, 0].copy()      
@@ -138,27 +180,7 @@ if __name__ == "__main__":
         time.sleep(10*dt)
 
   # debug info 
-  print("linear ||err_f||: ", np.linalg.norm(__compute_err(data, target_id, ee_id)))
-  print("rot ||err_f||: ", np.linalg.norm(__compute_err_mat(data, target_mat, ee_id))) # matrix frobenius norm 
+  print("Linear position error ||err_f||: ", np.linalg.norm(__compute_err(data, target_id, ee_id)))
+  print("Orientation error||err_f||: ", np.linalg.norm(__compute_err_mat(data, target_mat, ee_id))) # matrix frobenius norm 
 
-  # qfrc metadata 
-  print("qacc norm:", np.linalg.norm(data.qacc[:nq]))
-  print("qfrc_constraint norm:", np.linalg.norm(data.qfrc_constraint[:nq]))
-  print("qfrc_passive norm:", np.linalg.norm(data.qfrc_passive[:nq]))
-  print("qfrc_bias:", data.qfrc_bias[:nq])
-  print("qfrc_actuator:", data.qfrc_actuator[:nq])
-
-  # distance to joint limits 
-  q = data.qpos[:nq]
-  lo = model.jnt_range[:nq,0]
-  hi = model.jnt_range[:nq,1]
-  print("min dist to lo:", np.min(q-lo))
-  print("min dist to hi:", np.min(hi-q))
-
-  # contacts info 
-  print("ncon:", data.ncon)
-  for i in range(data.ncon):
-      c = data.contact[i]
-      g1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, c.geom1)
-      g2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, c.geom2)
-      print(i, g1, "<->", g2, "dist:", c.dist)
+  __debug_metadata(model, data)
