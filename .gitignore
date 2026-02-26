@@ -1,5 +1,10 @@
 # keep repo clean 
 .vscode/ 
-data/
 __pycache__/
+
+# docs
 MATH.md
+
+# scritgens
+scripts/
+src/full.py
