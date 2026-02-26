@@ -2,7 +2,6 @@
 
 KUKA LBR iiwa 14 in MuJoCo with:
 
--   A simple task-based inverse kinematics via DLS. 
 -   A RHC loop running MPC on the end-effector, aiming to track a simple target within the robot's reachable workspace.
 
 ![iiwa_14](data/kuka_iiwa_14/iiwa_14.png)
