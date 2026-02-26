@@ -12,8 +12,7 @@ KUKA LBR iiwa 14 in MuJoCo with:
 
 All credits for the KUKA iiwa 14 model and assets go to:
 
--   MuJoCo Menagerie:\
-    https://github.com/google-deepmind/mujoco_menagerie/tree/main/kuka_iiwa_14
+-   MuJoCo Menagerie: https://github.com/google-deepmind/mujoco_menagerie/tree/main/kuka_iiwa_14
 
 This repository includes a local copy of the model under
 `data/kuka_iiwa_14/`.
