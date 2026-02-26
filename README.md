@@ -31,7 +31,7 @@ tracking
 
 Relevant files: 
 - Robot XML: `data/kuka_iiwa_14/iiwa14.xml`
-- - Scene XML: `data/kuka_iiwa_14/scene.xml`
+- Scene XML: `data/kuka_iiwa_14/scene.xml`
 
 ---
 
