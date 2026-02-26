@@ -29,8 +29,9 @@ tracking
 -   End-effector site: `attachment_site`
 -   Position target body: `target_box`
 
-Relevant files: - Robot XML: `data/kuka_iiwa_14/iiwa14.xml` - Scene XML:
-`data/kuka_iiwa_14/scene.xml`
+Relevant files: 
+- Robot XML: `data/kuka_iiwa_14/iiwa14.xml`
+- - Scene XML: `data/kuka_iiwa_14/scene.xml`
 
 ---
 
