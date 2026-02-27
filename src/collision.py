@@ -72,25 +72,17 @@ def _geom_name(model: mujoco.MjModel, gid: int) -> str:
   return "" if name is None else name 
 
 
-def find_prefix_geoms(model: mujoco.MjModel, prefix: str) -> List[int]: 
-  """ 
-  Find geoms matching prefix in name.
-  Convention in place: 
-    - match links coating with `'safe_'`
-    - match spheroid obstacles with `'obs_'` 
-  """
-  gids: List[int] = []
-  for gid in range(model.ngeom):
-    if model.geom_type[gid] != mujoco.mjtGeom.mjGEOM_SPHERE:
-      continue 
-    if _geom_name(model, gid).startswith(prefix): 
-      gids.append(gid)
-  return gids
+def find_prefix_geoms(model: mujoco.MjModel, prefix: str, geom_type: mujoco.mjtGeom) -> List[int]:
+    gids: List[int] = []
+    for gid in range(model.ngeom):
+        if model.geom_type[gid] != geom_type:
+            continue
+        if _geom_name(model, gid).startswith(prefix):
+            gids.append(gid)
+    return gids
 
-
-def find_coating_capsules(model: mujoco.MjModel) -> List[int]: return find_prefix_geoms(model, "safe_")
-def find_sphere_obstacles(model: mujoco.MjModel) -> List[int]: return find_prefix_geoms(model, "obs_")
-
+def find_sphere_obstacles(model: mujoco.MjModel) -> List[int]:
+    return find_prefix_geoms(model, "obs_", mujoco.mjtGeom.mjGEOM_SPHERE)
 
 
 @dataclass 
@@ -141,8 +133,8 @@ def min_distance_and_grad(model: mujoco.MjModel, data: mujoco.MjData, q: np.ndar
   if q.shape[0] < n: 
     raise ValueError(f"q must have at least nq={n} entries")
   
-  base = min_distance(model, data, q, capsule_gids, sphere_gids)
-  grad = np.zeros((n,), dtype=float)
+  base: DistanceResult = min_distance(model, data, q, capsule_gids, sphere_gids)
+  grad: np.ndarray = np.zeros((n,), dtype=float)
 
   for i in range(n): 
     qp = q.copy(); qp[i] += eps 

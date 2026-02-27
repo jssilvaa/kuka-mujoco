@@ -63,6 +63,7 @@ class MPCController:
 
             if i % 200 == 0:
                 print(i, "||e||", norm_ek, "||u0||", float(np.linalg.norm(u0)))
+                print(i, "dmin", self.rti.last_dmin)
             
             if self.viewer is not None: 
                 self.viewer.sync()

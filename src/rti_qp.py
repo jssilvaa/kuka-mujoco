@@ -7,6 +7,7 @@ import scipy.sparse as sp
 import osqp 
 
 from interface import RobotInterface, mpcTask 
+from collision import min_distance_and_grad, find_coating_capsules, find_sphere_obstacles
 
 
 @dataclass
@@ -17,6 +18,8 @@ class RTIWeights:
   WeN: np.ndarray   # (6,6)
   WvN: np.ndarray   # (7,7)
   eps_dq: float     # (1,)
+  Ws: float         # scalar (e.g. active set of min_distance m=1)
+  rho_s: float 
 
   @staticmethod
   def default(): 
@@ -27,6 +30,8 @@ class RTIWeights:
         WeN=np.diag([400, 400, 400, 40, 40, 40]),
         WvN=np.diag([2, 2, 2, 2, 2, 2, 2]),
         eps_dq=float(1e-3),
+        Ws=float(1e4), 
+        rho_s=float(1e2)
     )
   
 
@@ -43,10 +48,12 @@ class RTITrackerQP:
   def __init__(self, cfg: RTIConfig, weights: RTIWeights): 
     self.cfg = cfg 
     self.w = weights
+    self.d_safe = 0.1 # safety distance [m]
 
     # nominal trajectories - containers for warm start 
     self.qbar = np.zeros((cfg.N + 1, cfg.n))
     self.ubar = np.zeros((cfg.N, cfg.n))
+    self.last_dmin = None 
 
     self._solver = None 
     self._last_solution = None 
@@ -64,7 +71,7 @@ class RTITrackerQP:
 
   def solve_rti(self, model, data, iface: RobotInterface, q_meas: np.ndarray): 
     N, n = self.cfg.N, self.cfg.n 
-    nx = n
+    nq = n
     nu = n 
     
     tasks = []
@@ -73,13 +80,30 @@ class RTITrackerQP:
         mujoco.mj_forward(model, data)
         tasks.append(mpcTask.task_k(model, data, iface))
 
-    # index terms in the qp 
-    n_dx = (N+1)*nx
-    n_du = N*nu 
-    nz = n_dx + n_du 
+    dbar = np.zeros((N+1,), dtype=float)
+    Dbar = np.zeros((N+1,n), dtype=float)
 
-    def idx_dq(k): return slice(k*nx, (k+1)*nx)
-    def idx_du(k): return slice(n_dx + k*nu, n_dx + (k+1)*nu)
+    capsule_gids = find_coating_capsules(model)
+    sphere_gids = find_sphere_obstacles(model)
+    for k in range(N+1): 
+       res, grad = min_distance_and_grad(
+          model, data,
+          self.qbar[k],
+          capsule_gids, sphere_gids,
+          eps=1e-4
+       )
+       dbar[k] = res.dmin 
+       Dbar[k, :] = grad
+
+    # index terms in the qp 
+    n_dq = (N+1)*nq
+    n_du = N*nu 
+    n_s = (N+1)*1
+    nz = n_dq + n_du + n_s
+
+    def idx_dq(k): return slice(k*nq, (k+1)*nq)
+    def idx_du(k): return slice(n_dq + k*nu, n_dq + (k+1)*nu)
+    def idx_s(k): return slice(n_dq + n_du + k*1, n_dq + n_du + (k+1)*1)
 
     # build H and f 
     H = np.zeros((nz,nz))
@@ -94,8 +118,9 @@ class RTITrackerQP:
 
       H[idx_dq(k), idx_dq(k)] += 2.0 * Qqq + self.w.eps_dq * np.eye(n)
       H[idx_du(k), idx_du(k)] += 2.0 * self.w.Wa
+      H[idx_s(k), idx_s(k)] += 2.0 * self.w.Ws 
       f[idx_dq(k)] += 2.0 * gq
-
+      f[idx_s(k)] += self.w.rho_s
 
     JN = tasks[N].Jk
     eN = tasks[N].ek
@@ -103,23 +128,25 @@ class RTITrackerQP:
     gqN  = - JN.T @ self.w.WeN @ eN
     
     H[idx_dq(N), idx_dq(N)] += 2.0 * QqqN
+    H[idx_s(N), idx_s(N)] += 2.0 * self.w.Ws
     f[idx_dq(N)] += 2.0 * gqN
+    f[idx_s(N)] += self.w.rho_s 
 
-    n_eq = nx + N*nx
+    n_eq = nq + N*nq
     Aeq = np.zeros((n_eq, nz))
     beq = np.zeros((n_eq,))
     row = 0
 
     # dq0 = q_meas - qbar0
-    Aeq[row:row+nx, idx_dq(0)] = np.eye(nx)
-    beq[row:row+nx] = q_meas - self.qbar[0]
-    row += nx
+    Aeq[row:row+nq, idx_dq(0)] = np.eye(nq)
+    beq[row:row+nq] = q_meas - self.qbar[0]
+    row += nq
 
     for k in range(N):
-        Aeq[row:row+nx, idx_dq(k+1)] = np.eye(nx)
-        Aeq[row:row+nx, idx_dq(k)]  += -np.eye(nx)
-        Aeq[row:row+nx, idx_du(k)]  += -(self.cfg.h * np.eye(nu))
-        row += nx
+        Aeq[row:row+nq, idx_dq(k+1)] = np.eye(nq)
+        Aeq[row:row+nq, idx_dq(k)]  += -np.eye(nq)
+        Aeq[row:row+nq, idx_du(k)]  += -(self.cfg.h * np.eye(nu))
+        row += nq
 
     A_list = [Aeq]
     l_list = [beq]
@@ -130,14 +157,37 @@ class RTITrackerQP:
     l_du = np.zeros((n_du,))
     u_du = np.zeros((n_du,))
     for k in range(N):
-        sl = idx_du(k)
-        A_du[k*nu:(k+1)*nu, sl] = np.eye(nu)
+        A_du[k*nu:(k+1)*nu, idx_du(k)] = np.eye(nu)
         l_du[k*nu:(k+1)*nu] = self.cfg.u_min - self.ubar[k]
         u_du[k*nu:(k+1)*nu] = self.cfg.u_max - self.ubar[k]
 
     A_list.append(A_du)
     l_list.append(l_du)
     u_list.append(u_du)
+
+    A_clear = np.zeros((N+1, nz))
+    l_clear = -np.inf * np.ones((N+1,))
+    u_clear = np.zeros((N+1,))
+    for k in range(N+1): 
+       # -D_k * dq_k - 1 * s_k <= dbar_k - d_safe
+       A_clear[k, idx_dq(k)] = - Dbar[k, :]
+       A_clear[k, idx_s(k)] = -1.0 
+       u_clear[k] = dbar[k] - self.d_safe 
+
+    A_list.append(A_clear)
+    l_list.append(l_clear)
+    u_list.append(u_clear)
+
+    A_spos = np.zeros((N+1, nz))
+    l_spos = - np.inf * np.ones((N+1,))
+    u_spos = np.zeros((N+1,))
+    for k in range(N+1): 
+       A_spos[k, idx_s(k)] = -1.0
+       u_spos[k] = 0.0 
+
+    A_list.append(A_spos)
+    l_list.append(l_spos)
+    u_list.append(u_spos)
 
     A = np.vstack(A_list)
     l = np.concatenate(l_list)
@@ -160,9 +210,10 @@ class RTITrackerQP:
 
     z = res.x
     self._last_solution = z
+    self.last_dmin = dbar[0]
 
-    dq_all = z[:n_dx].reshape((N+1, nx))          # (N+1, n)
-    du_all = z[n_dx:].reshape((N, nu))            # (N, n)
+    dq_all = z[:n_dq].reshape((N+1, nq))          # (N+1, n)
+    du_all = z[n_dq:].reshape((N, nu))            # (N, n)
 
     self.qbar += dq_all
     self.ubar += du_all
