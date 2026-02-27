@@ -10,10 +10,12 @@ from mpc_controller import MPCController
 from verification import debug_metadata
 
 
-def _load_model(path: str) -> Tuple[mujoco.MjModel, mujoco.MjData]: 
+def _load_model(path: str, trigger_keyframe: bool = True) -> Tuple[mujoco.MjModel, mujoco.MjData]: 
   """ loads scene/model from xml path """
   model = mujoco.MjModel.from_xml_path(path)
   data  = mujoco.MjData(model)
+  if trigger_keyframe: 
+      mujoco.mj_resetDataKeyframe(model, data, 0)
   mujoco.mj_forward(model, data)
   return model, data
 

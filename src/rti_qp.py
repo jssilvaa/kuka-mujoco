@@ -7,7 +7,7 @@ import scipy.sparse as sp
 import osqp 
 
 from interface import RobotInterface, mpcTask 
-from collision import min_distance_and_grad, find_coating_capsules, find_sphere_obstacles
+from collision import min_distance, min_distance_and_grad, find_coating_geoms, find_sphere_obstacles
 
 
 @dataclass
@@ -27,11 +27,11 @@ class RTIWeights:
         We=np.diag([200, 200, 200, 20, 20, 20]),
         Wv=np.diag([1, 1, 1, 1, 1, 1, 1]),
         Wa=np.diag([1e-2]*7),
-        WeN=np.diag([400, 400, 400, 40, 40, 40]),
+        WeN=np.diag([800, 800, 800, 40, 40, 40]),
         WvN=np.diag([2, 2, 2, 2, 2, 2, 2]),
         eps_dq=float(1e-3),
-        Ws=float(1e4), 
-        rho_s=float(1e2)
+        Ws=float(1e3), 
+        rho_s=float(10)
     )
   
 
@@ -45,15 +45,20 @@ class RTIConfig:
 
 
 class RTITrackerQP: 
-  def __init__(self, cfg: RTIConfig, weights: RTIWeights): 
+  def __init__(self, model: mujoco.MjModel, cfg: RTIConfig, weights: RTIWeights): 
     self.cfg = cfg 
     self.w = weights
-    self.d_safe = 0.1 # safety distance [m]
+    self.d_safe = 0.05 # safety distance [m]
+    self.clearance_active = False 
+
+    self.capsule_gids = find_coating_geoms(model)
+    self.sphere_gids = find_sphere_obstacles(model)
 
     # nominal trajectories - containers for warm start 
     self.qbar = np.zeros((cfg.N + 1, cfg.n))
     self.ubar = np.zeros((cfg.N, cfg.n))
     self.last_dmin = None 
+    self.last_smax = None 
 
     self._solver = None 
     self._last_solution = None 
@@ -69,31 +74,33 @@ class RTITrackerQP:
       for k in range(self.cfg.N):
           self.qbar[k+1] = self.qbar[k] + self.cfg.h * self.ubar[k]
 
-  def solve_rti(self, model, data, iface: RobotInterface, q_meas: np.ndarray): 
+  def solve_rti(self, model: mujoco.MjModel, data: mujoco.MjData, iface: RobotInterface, q_meas: np.ndarray): 
     N, n = self.cfg.N, self.cfg.n 
     nq = n
     nu = n 
-    
+
+    qpos0 = data.qpos[:n].copy()
+    qvel0 = data.qvel[:n].copy()
+        
     tasks = []
     for k in range(N+1):
         data.qpos[:n] = self.qbar[k]
         mujoco.mj_forward(model, data)
         tasks.append(mpcTask.task_k(model, data, iface))
 
-    dbar = np.zeros((N+1,), dtype=float)
-    Dbar = np.zeros((N+1,n), dtype=float)
+    if self.clearance_active:
+      dbar = np.zeros((N+1,), dtype=float)
+      Dbar = np.zeros((N+1,n), dtype=float)
 
-    capsule_gids = find_coating_capsules(model)
-    sphere_gids = find_sphere_obstacles(model)
-    for k in range(N+1): 
-       res, grad = min_distance_and_grad(
-          model, data,
-          self.qbar[k],
-          capsule_gids, sphere_gids,
-          eps=1e-4
-       )
-       dbar[k] = res.dmin 
-       Dbar[k, :] = grad
+      for k in range(N+1): 
+        res, grad = min_distance_and_grad(
+            model, data,
+            self.qbar[k],
+            self.capsule_gids, self.sphere_gids,
+            eps=1e-4
+        )
+        dbar[k] = res.dmin 
+        Dbar[k, :] = grad
 
     # index terms in the qp 
     n_dq = (N+1)*nq
@@ -117,10 +124,13 @@ class RTITrackerQP:
       gq  = - Jk.T @ self.w.We @ ek
 
       H[idx_dq(k), idx_dq(k)] += 2.0 * Qqq + self.w.eps_dq * np.eye(n)
-      H[idx_du(k), idx_du(k)] += 2.0 * self.w.Wa
-      H[idx_s(k), idx_s(k)] += 2.0 * self.w.Ws 
       f[idx_dq(k)] += 2.0 * gq
-      f[idx_s(k)] += self.w.rho_s
+      
+      H[idx_du(k), idx_du(k)] += 2.0 * self.w.Wa
+      
+      if self.clearance_active:
+        H[idx_s(k), idx_s(k)] += 2.0 * self.w.Ws 
+        f[idx_s(k)] += self.w.rho_s
 
     JN = tasks[N].Jk
     eN = tasks[N].ek
@@ -128,9 +138,10 @@ class RTITrackerQP:
     gqN  = - JN.T @ self.w.WeN @ eN
     
     H[idx_dq(N), idx_dq(N)] += 2.0 * QqqN
-    H[idx_s(N), idx_s(N)] += 2.0 * self.w.Ws
     f[idx_dq(N)] += 2.0 * gqN
-    f[idx_s(N)] += self.w.rho_s 
+    if self.clearance_active:
+      H[idx_s(N), idx_s(N)] += 2.0 * self.w.Ws
+      f[idx_s(N)] += self.w.rho_s 
 
     n_eq = nq + N*nq
     Aeq = np.zeros((n_eq, nz))
@@ -165,29 +176,39 @@ class RTITrackerQP:
     l_list.append(l_du)
     u_list.append(u_du)
 
-    A_clear = np.zeros((N+1, nz))
-    l_clear = -np.inf * np.ones((N+1,))
-    u_clear = np.zeros((N+1,))
-    for k in range(N+1): 
-       # -D_k * dq_k - 1 * s_k <= dbar_k - d_safe
-       A_clear[k, idx_dq(k)] = - Dbar[k, :]
-       A_clear[k, idx_s(k)] = -1.0 
-       u_clear[k] = dbar[k] - self.d_safe 
+    if self.clearance_active: 
+      A_clear = np.zeros((N+1, nz))
+      l_clear = -np.inf * np.ones((N+1,))
+      u_clear = np.zeros((N+1,))
+      for k in range(N+1): 
+        # -D_k * dq_k - 1 * s_k <= dbar_k - d_safe
+        A_clear[k, idx_dq(k)] = - Dbar[k, :]
+        A_clear[k, idx_s(k)] = -1.0 
+        u_clear[k] = dbar[k] - self.d_safe 
 
-    A_list.append(A_clear)
-    l_list.append(l_clear)
-    u_list.append(u_clear)
+      A_list.append(A_clear)
+      l_list.append(l_clear)
+      u_list.append(u_clear)
 
-    A_spos = np.zeros((N+1, nz))
-    l_spos = - np.inf * np.ones((N+1,))
-    u_spos = np.zeros((N+1,))
-    for k in range(N+1): 
-       A_spos[k, idx_s(k)] = -1.0
-       u_spos[k] = 0.0 
+      A_spos = np.zeros((N+1, nz))
+      l_spos = - np.inf * np.ones((N+1,))
+      u_spos = np.zeros((N+1,))
+      for k in range(N+1): 
+        A_spos[k, idx_s(k)] = -1.0
+        u_spos[k] = 0.0 
 
-    A_list.append(A_spos)
-    l_list.append(l_spos)
-    u_list.append(u_spos)
+      A_list.append(A_spos)
+      l_list.append(l_spos)
+      u_list.append(u_spos)
+    else: 
+      A_szero = np.zeros((N+1, nz))
+      l_szero = np.zeros((N+1,))
+      u_szero = np.zeros((N+1,))
+      for k in range(N+1):
+          A_szero[k, idx_s(k)] = 1.0   # s_k = 0
+      A_list.append(A_szero)
+      l_list.append(l_szero)
+      u_list.append(u_szero)
 
     A = np.vstack(A_list)
     l = np.concatenate(l_list)
@@ -199,7 +220,16 @@ class RTITrackerQP:
     A_sp = sp.csc_matrix(A)
 
     self._solver = osqp.OSQP()
-    self._solver.setup(P=P, q=q, A=A_sp, l=l, u=u, verbose=False, polish=True)
+    self._solver.setup(
+      P=P, q=q, A=A_sp, l=l, u=u,
+      verbose=False,
+      polish=True,
+      max_iter=20000,
+      eps_abs=1e-4,
+      eps_rel=1e-4,
+      adaptive_rho=True,
+      scaling=10,
+    )
     
     if self._last_solution is not None:
         self._solver.warm_start(x=self._last_solution)
@@ -210,11 +240,22 @@ class RTITrackerQP:
 
     z = res.x
     self._last_solution = z
-    self.last_dmin = dbar[0]
+    if self.clearance_active:
+      self.last_dmin = dbar[0]
+    else: 
+      self.last_dmin = min_distance(model, data, self.qbar[0], self.capsule_gids, self.sphere_gids).dmin 
 
-    dq_all = z[:n_dq].reshape((N+1, nq))          # (N+1, n)
-    du_all = z[n_dq:].reshape((N, nu))            # (N, n)
+    dq_all = z[:n_dq].reshape((N+1, nq))          # (N+1,n)
+    du_all = z[n_dq:n_dq+n_du].reshape((N, nu))   # (N,n)
+    if self.clearance_active:
+      s_all  = z[n_dq+n_du:]                        # (N+1,)
+      self.last_smax = float(np.max(s_all)) 
 
     self.qbar += dq_all
     self.ubar += du_all
+
+    data.qpos[:n] = qpos0
+    data.qvel[:n] = qvel0
+    mujoco.mj_forward(model, data)
+
     return self.ubar[0].copy()
